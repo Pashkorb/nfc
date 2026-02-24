@@ -1,0 +1,3 @@
+/home/pkorban/fan/CMakeFiles/f401_bare.elf.dir
+/home/pkorban/fan/CMakeFiles/edit_cache.dir
+/home/pkorban/fan/CMakeFiles/rebuild_cache.dir
