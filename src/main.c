@@ -749,41 +749,54 @@ int main(void)
 
     g_err = ERR_OK;
     g_rx_has_crc = 0u;
+
+    // Этап 1: базовая инициализация МК и периферии; проверять, что тактирование и GPIO поднялись без зависаний.
     g_stage = ST_HW_INIT;
     hw_init_periph();
 
+    // Этап 2: аппаратный reset RC522 и первичная настройка; проверять, что stage_rc522_reset_and_basic_init() возвращает ERR_OK.
     st = stage_rc522_reset_and_basic_init();
     if (st != ERR_OK) { g_err = st; while (1) {} }
 
+    // Этап 3: чтение версии RC522; проверять, что g_rc522_ver не равен 0x00 и 0xFF.
     g_stage = ST_RC522_READ_VERSION;
     g_rc522_ver = rc522_read_reg(RC522_REG_VERSION);
     if (g_rc522_ver == 0x00u || g_rc522_ver == 0xFFu) { g_err = ERR_PROTO; while (1) {} }
 
+    // Этап 4: включение RF-передатчика и CRC; проверять, что антенна включена и последующие кадры идут с корректным CRC.
     g_stage = ST_RC522_CONFIG;
     rc522_write_reg(RC522_REG_TX_CONTROL, (uint8_t)(rc522_read_reg(RC522_REG_TX_CONTROL) | 0x03u));
     rc522_set_auto_crc(true);
 
+    // Этап 5: запрос карты (REQA); проверять, что карта отвечает и нет ERR_TIMEOUT/ERR_PROTO.
     st = stage_reqa();
     if (st != ERR_OK) { g_err = st; while (1) {} }
 
+    // Этап 6: антиколлизия; проверять, что UID считан полностью и BCC/CRC в норме.
     st = stage_anticoll();
     if (st != ERR_OK) { g_err = st; while (1) {} }
 
+    // Этап 7: SELECT карты; проверять, что карта переведена в selected state и SAK корректен.
     st = stage_select();
     if (st != ERR_OK) { g_err = st; while (1) {} }
 
+    // Этап 8: RATS/ATS для Type 4; проверять, что получен ATS и параметры канала согласованы.
     st = stage_rats();
     if (st != ERR_OK) { g_err = st; while (1) {} }
 
+    // Этап 9: аутентификация к приложению/файлу; проверять, что status words/коды функций дают успешный доступ.
     st = stage_authenticate();
     if (st != ERR_OK) { g_err = st; while (1) {} }
 
+    // Этап 10: запись NDEF URL в NTAG424; проверять, что APDU записи завершился с SW=0x9000.
     st = stage_program_ntag424_url();
     if (st != ERR_OK) { g_err = st; while (1) {} }
 
+    // Этап 11: пост-настройка ключей после записи URL; проверять, что смена/проверка ключей проходит без ERR_AUTH.
     st = stage_post_url_keys();
     if (st != ERR_OK) { g_err = st; while (1) {} }
 
+    // Этап 12: успешное завершение сценария; проверять, что g_err == ERR_OK и g_stage перешёл в ST_DONE.
     g_stage = ST_DONE;
     while (1) {
     }
