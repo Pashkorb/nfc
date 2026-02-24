@@ -41,6 +41,10 @@ set(RELEASE_FLAGS
 
 set(SRCS
   src/main.c
+  src/system_stm32f4xx.c
+  mcu_core/STM32F4xx_StdPeriph_Driver/src/stm32f4xx_gpio.c
+  mcu_core/STM32F4xx_StdPeriph_Driver/src/stm32f4xx_rcc.c
+  mcu_core/STM32F4xx_StdPeriph_Driver/src/stm32f4xx_spi.c
 )
 
 list(APPEND SRCS ${FREERTOS_KERNEL})
