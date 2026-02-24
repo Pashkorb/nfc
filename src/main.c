@@ -83,10 +83,16 @@ volatile uint8_t g_last_resp[128];
 volatile uint16_t g_last_resp_len;
 volatile uint8_t g_last_sw1, g_last_sw2;
 volatile uint8_t g_last_uid_len;
-volatile uint8_t g_rx_has_crc;
-volatile uint8_t g_t4_last_rx_len;
-volatile uint8_t g_t4_last_tail4[4];
-volatile uint8_t g_t4_parse_mode;
+volatile uint8_t g_last_tx[64];
+volatile uint8_t g_last_tx_len;
+volatile uint8_t g_last_rx[64];
+volatile uint8_t g_last_rx_len;
+volatile uint8_t g_last_reqa_cmd;
+volatile uint8_t g_last_reqa_tries;
+volatile uint8_t g_t2_last_page;
+volatile uint8_t g_t2_last_write[4];
+volatile uint8_t g_t2_last_ack[4];
+volatile uint8_t g_t2_last_ack_len;
 
 static const char g_url[] = "https://www.google.com";
 static const char g_key_source_url[] = "https://example.com/keys";
@@ -105,14 +111,6 @@ static void spin_delay(volatile uint32_t n)
     while (n--) {
         __NOP();
     }
-}
-
-static bool is_plausible_sw1(uint8_t sw1)
-{
-    if (sw1 == 0x90u || sw1 == 0x61u || sw1 == 0x62u || sw1 == 0x63u) {
-        return true;
-    }
-    return (sw1 >= 0x67u && sw1 <= 0x6Fu);
 }
 
 void hw_init_periph(void)
@@ -203,12 +201,23 @@ void rc522_set_auto_crc(bool en)
     rc522_write_reg(RC522_REG_RX_MODE, rx);
 }
 
+static void rc522_rf_field_reset(void)
+{
+    uint8_t txc = rc522_read_reg(RC522_REG_TX_CONTROL);
+    rc522_write_reg(RC522_REG_TX_CONTROL, (uint8_t)(txc & (uint8_t)~0x03u));
+    spin_delay(120000u);
+    rc522_write_reg(RC522_REG_TX_CONTROL, (uint8_t)(txc | 0x03u));
+}
+
 int rc522_transceive(const uint8_t* tx, uint8_t tx_len,
                      uint8_t* rx, uint8_t rx_max, uint8_t* rx_len,
                      uint8_t bit_framing, bool use_crc)
 {
     uint32_t i;
     uint8_t irq;
+
+    g_last_tx_len = tx_len > sizeof(g_last_tx) ? sizeof(g_last_tx) : tx_len;
+    memcpy((void*)g_last_tx, tx, g_last_tx_len);
 
     *rx_len = 0;
     rc522_set_auto_crc(use_crc);
@@ -263,6 +272,8 @@ int rc522_transceive(const uint8_t* tx, uint8_t tx_len,
         rx[i] = rc522_read_reg(RC522_REG_FIFO_DATA);
     }
     *rx_len = g_last_fifolevel;
+    g_last_rx_len = *rx_len > sizeof(g_last_rx) ? sizeof(g_last_rx) : *rx_len;
+    memcpy((void*)g_last_rx, rx, g_last_rx_len);
 
     return ERR_OK;
 }
@@ -293,19 +304,35 @@ static int stage_rc522_reset_and_basic_init(void)
 static int stage_reqa(void)
 {
     uint8_t reqa = 0x26u;
+    uint8_t wupa = 0x52u;
     uint8_t rx[8];
     uint8_t rx_len = 0;
+    uint8_t tries;
     int st;
 
     g_stage = ST_PICC_REQA;
-    st = rc522_transceive(&reqa, 1u, rx, sizeof(rx), &rx_len, 0x07u, false);
-    if (st != ERR_OK || rx_len < 2u) {
-        return st == ERR_OK ? ERR_PROTO : st;
+    for (tries = 1u; tries <= 6u; tries++) {
+        g_last_reqa_tries = tries;
+        g_last_reqa_cmd = reqa;
+        st = rc522_transceive(&reqa, 1u, rx, sizeof(rx), &rx_len, 0x07u, false);
+        if (st == ERR_OK && rx_len >= 2u) {
+            g_last_atqa[0] = rx[0];
+            g_last_atqa[1] = rx[1];
+            return ERR_OK;
+        }
+
+        g_last_reqa_cmd = wupa;
+        st = rc522_transceive(&wupa, 1u, rx, sizeof(rx), &rx_len, 0x07u, false);
+        if (st == ERR_OK && rx_len >= 2u) {
+            g_last_atqa[0] = rx[0];
+            g_last_atqa[1] = rx[1];
+            return ERR_OK;
+        }
+
+        rc522_rf_field_reset();
     }
 
-    g_last_atqa[0] = rx[0];
-    g_last_atqa[1] = rx[1];
-    return ERR_OK;
+    return st == ERR_OK ? ERR_PROTO : st;
 }
 
 static int picc_anticoll_one_level(uint8_t sel, uint8_t* uidcl)
@@ -450,70 +477,25 @@ static int stage_rats(void)
 static int parse_isodep_inf(const uint8_t* rx, uint8_t rx_len,
                             uint8_t* inf, uint16_t inf_max, uint16_t* inf_len)
 {
-    uint16_t inf_a = 0;
-    uint16_t inf_b = 0;
-    bool has_a = false;
-    bool has_b = false;
-    uint8_t sw1_a = 0;
-    uint8_t sw1_b = 0;
+    uint16_t payload_len;
     uint16_t i;
 
     g_stage = ST_T4_APDU_PARSE;
-    g_t4_last_rx_len = rx_len;
-    g_t4_last_tail4[0] = 0u;
-    g_t4_last_tail4[1] = 0u;
-    g_t4_last_tail4[2] = 0u;
-    g_t4_last_tail4[3] = 0u;
-    for (i = 0; i < 4u && i < rx_len; i++) {
-        g_t4_last_tail4[3u - i] = rx[rx_len - 1u - i];
-    }
-
-    if (rx_len >= 5u) {
-        inf_a = (uint16_t)rx_len - 3u;
-        sw1_a = rx[rx_len - 4u];
-        has_a = is_plausible_sw1(sw1_a);
-    }
-    if (rx_len >= 4u) {
-        inf_b = (uint16_t)rx_len - 1u;
-        sw1_b = rx[rx_len - 2u];
-        has_b = is_plausible_sw1(sw1_b);
-    }
-
-    if (g_rx_has_crc == 1u) {
-        has_b = false;
-    } else if (g_rx_has_crc == 2u) {
-        has_a = false;
-    }
-
-    if (!has_a && !has_b) {
+    if (rx_len < 5u) {
         return ERR_PROTO;
     }
 
-    if (has_a && (!has_b || sw1_a == 0x90u)) {
-        if (inf_a > inf_max) {
-            return ERR_SIZE;
-        }
-        for (i = 0; i < inf_a; i++) {
-            inf[i] = rx[1u + i];
-        }
-        *inf_len = inf_a;
-        g_last_sw1 = inf[*inf_len - 2u];
-        g_last_sw2 = inf[*inf_len - 1u];
-        g_rx_has_crc = 1u;
-        g_t4_parse_mode = 1u;
-    } else {
-        if (inf_b > inf_max) {
-            return ERR_SIZE;
-        }
-        for (i = 0; i < inf_b; i++) {
-            inf[i] = rx[1u + i];
-        }
-        *inf_len = inf_b;
-        g_last_sw1 = inf[*inf_len - 2u];
-        g_last_sw2 = inf[*inf_len - 1u];
-        g_rx_has_crc = 2u;
-        g_t4_parse_mode = 2u;
+    payload_len = (uint16_t)rx_len - 3u;
+    if (payload_len > inf_max) {
+        return ERR_SIZE;
     }
+
+    for (i = 0; i < payload_len; i++) {
+        inf[i] = rx[1u + i];
+    }
+    *inf_len = payload_len;
+    g_last_sw1 = inf[*inf_len - 2u];
+    g_last_sw2 = inf[*inf_len - 1u];
 
     g_last_resp_len = *inf_len > sizeof(g_last_resp) ? sizeof(g_last_resp) : *inf_len;
     for (i = 0; i < g_last_resp_len; i++) {
@@ -648,6 +630,120 @@ uint8_t build_ndef_from_url(uint8_t* out, uint8_t out_max)
     return (uint8_t)(2u + ndef_len);
 }
 
+static uint8_t build_ndef_message_url(uint8_t* out, uint8_t out_max)
+{
+    uint8_t tmp[255];
+    uint8_t ndef_full_len = build_ndef_from_url(tmp, sizeof(tmp));
+    if (ndef_full_len < 3u) {
+        return 0u;
+    }
+    if ((uint8_t)(ndef_full_len - 2u) > out_max) {
+        return 0u;
+    }
+    memcpy(out, &tmp[2], (uint8_t)(ndef_full_len - 2u));
+    return (uint8_t)(ndef_full_len - 2u);
+}
+
+static int t2_read_pages(uint8_t start_page, uint8_t out16[16])
+{
+    uint8_t cmd[2] = {0x30u, start_page};
+    uint8_t rx[32];
+    uint8_t rx_len = 0;
+    int st = rc522_transceive(cmd, sizeof(cmd), rx, sizeof(rx), &rx_len, 0x00u, true);
+    if (st != ERR_OK) {
+        return st;
+    }
+    if (rx_len < 16u) {
+        return ERR_PROTO;
+    }
+    memcpy(out16, rx, 16u);
+    return ERR_OK;
+}
+
+static int t2_write_page(uint8_t page, const uint8_t data4[4])
+{
+    uint8_t cmd[6] = {0xA2u, page, data4[0], data4[1], data4[2], data4[3]};
+    uint8_t rx[8];
+    uint8_t rx_len = 0;
+    int st;
+
+    g_t2_last_page = page;
+    memcpy((void*)g_t2_last_write, data4, 4u);
+    g_t2_last_ack_len = 0u;
+    memset((void*)g_t2_last_ack, 0, sizeof(g_t2_last_ack));
+
+    st = rc522_transceive(cmd, sizeof(cmd), rx, sizeof(rx), &rx_len, 0x00u, true);
+    if (st != ERR_OK) {
+        return st;
+    }
+    g_t2_last_ack_len = rx_len > sizeof(g_t2_last_ack) ? sizeof(g_t2_last_ack) : rx_len;
+    memcpy((void*)g_t2_last_ack, rx, g_t2_last_ack_len);
+    if (rx_len == 0u || rx[0] != 0x0Au) {
+        return ERR_PROTO;
+    }
+    return ERR_OK;
+}
+
+static int t2_write_ndef_url(void)
+{
+    uint8_t cc16[16];
+    uint8_t ndef_msg[255];
+    uint8_t tlv[300];
+    uint8_t verify[16];
+    uint16_t ndef_len;
+    uint16_t tlv_len;
+    uint16_t i;
+    uint16_t write_off;
+    uint8_t page_data[4];
+    int st;
+
+    st = t2_read_pages(0x03u, cc16);
+    if (st != ERR_OK) {
+        return st;
+    }
+    if (cc16[0] != 0xE1u || cc16[1] != 0x10u) {
+        return ERR_PROTO;
+    }
+
+    ndef_len = build_ndef_message_url(ndef_msg, sizeof(ndef_msg));
+    if (ndef_len == 0u || ndef_len > 254u) {
+        return ERR_SIZE;
+    }
+
+    tlv[0] = 0x03u;
+    tlv[1] = (uint8_t)ndef_len;
+    memcpy(&tlv[2], ndef_msg, ndef_len);
+    tlv[2u + ndef_len] = 0xFEu;
+    tlv_len = (uint16_t)(3u + ndef_len);
+
+    while ((tlv_len % 4u) != 0u) {
+        tlv[tlv_len++] = 0x00u;
+    }
+
+    for (write_off = 0; write_off < tlv_len; write_off += 4u) {
+        page_data[0] = tlv[write_off + 0u];
+        page_data[1] = tlv[write_off + 1u];
+        page_data[2] = tlv[write_off + 2u];
+        page_data[3] = tlv[write_off + 3u];
+        st = t2_write_page((uint8_t)(4u + (write_off / 4u)), page_data);
+        if (st != ERR_OK) {
+            return st;
+        }
+    }
+
+    st = t2_read_pages(0x04u, verify);
+    if (st != ERR_OK) {
+        return st;
+    }
+    for (i = 0; i < 16u && i < tlv_len; i++) {
+        if (verify[i] != tlv[i]) {
+            return ERR_PROTO;
+        }
+    }
+
+    return ERR_OK;
+}
+
 static int stage_authenticate(void)
 {
     g_stage = ST_AUTH;
@@ -709,11 +805,11 @@ static int stage_program_ntag424_url(void)
     }
 
     g_stage = ST_T4_PARSE_CC;
-    if (cc[6] != 0x04u || cc[7] != 0x06u) {
+    if (cc[7] != 0x04u || cc[8] != 0x06u) {
         return ERR_CC_PARSE;
     }
-    fid_h = cc[8];
-    fid_l = cc[9];
+    fid_h = cc[9];
+    fid_l = cc[10];
 
     g_stage = ST_T4_SELECT_NDEF;
     apdu_select_ndef[5] = fid_h;
@@ -746,9 +842,9 @@ static int stage_program_ntag424_url(void)
 int main(void)
 {
     int st;
+    bool is_isodep;
 
     g_err = ERR_OK;
-    g_rx_has_crc = 0u;
 
     // Этап 1: базовая инициализация МК и периферии; проверять, что тактирование и GPIO поднялись без зависаний.
     g_stage = ST_HW_INIT;
@@ -780,21 +876,28 @@ int main(void)
     st = stage_select();
     if (st != ERR_OK) { g_err = st; while (1) {} }
 
-    // Этап 8: RATS/ATS для Type 4; проверять, что получен ATS и параметры канала согласованы.
-    st = stage_rats();
-    if (st != ERR_OK) { g_err = st; while (1) {} }
+    is_isodep = ((g_last_sak & 0x20u) != 0u);
 
-    // Этап 9: аутентификация к приложению/файлу; проверять, что status words/коды функций дают успешный доступ.
-    st = stage_authenticate();
-    if (st != ERR_OK) { g_err = st; while (1) {} }
+    if (is_isodep) {
+        // Этап 8: RATS/ATS для Type 4; проверять, что получен ATS и параметры канала согласованы.
+        st = stage_rats();
+        if (st != ERR_OK) { g_err = st; while (1) {} }
 
-    // Этап 10: запись NDEF URL в NTAG424; проверять, что APDU записи завершился с SW=0x9000.
-    st = stage_program_ntag424_url();
-    if (st != ERR_OK) { g_err = st; while (1) {} }
+        // Этап 9: аутентификация к приложению/файлу; проверять, что status words/коды функций дают успешный доступ.
+        st = stage_authenticate();
+        if (st != ERR_OK) { g_err = st; while (1) {} }
 
-    // Этап 11: пост-настройка ключей после записи URL; проверять, что смена/проверка ключей проходит без ERR_AUTH.
-    st = stage_post_url_keys();
-    if (st != ERR_OK) { g_err = st; while (1) {} }
+        // Этап 10: запись NDEF URL в NTAG424; проверять, что APDU записи завершился с SW=0x9000.
+        st = stage_program_ntag424_url();
+        if (st != ERR_OK) { g_err = st; while (1) {} }
+
+        // Этап 11: пост-настройка ключей после записи URL; проверять, что смена/проверка ключей проходит без ERR_AUTH.
+        st = stage_post_url_keys();
+        if (st != ERR_OK) { g_err = st; while (1) {} }
+    } else {
+        st = t2_write_ndef_url();
+        if (st != ERR_OK) { g_err = st; while (1) {} }
+    }
 
     // Этап 12: успешное завершение сценария; проверять, что g_err == ERR_OK и g_stage перешёл в ST_DONE.
     g_stage = ST_DONE;
